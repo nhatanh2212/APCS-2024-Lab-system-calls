@@ -1,0 +1,378 @@
+diff --git a/Makefile b/Makefile
+index 04b0290..95ad132 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,14 +188,13 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-	$U/_sleep\
+ 	$U/_find\
+ 	$U/_xargs\
+ 	$U/_pingpong\
+ 	$U/_primes\
+-
+-
+-
++	$U/_sleep\
++	$U/_trace\
++	$U/_sysinfotest\
+ 
+ ifeq ($(LAB),$(filter $(LAB), lock))
+ UPROGS += \
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..9ee7a7b 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,7 +63,7 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
+-
++uint64          freemem_size(void);
+ // log.c
+ void            initlog(int, struct superblock*);
+ void            log_write(struct buf*);
+@@ -82,6 +82,7 @@ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
+ 
+ // proc.c
++uint64          count_proc(void);
+ int             cpuid(void);
+ void            exit(int);
+ int             fork(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..44991e4 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,21 @@ kalloc(void)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++
++uint64
++freemem_size(void)
++{
++  acquire(&kmem.lock); // prevent race condition
++
++  uint64 size = 0;
++  struct run *r = kmem.freelist;
++  while (r) {
++    size++;
++    r = r->next;
++  }
++  
++  release(&kmem.lock);
++
++  return size * PGSIZE;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..b5ce20a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -310,6 +310,8 @@ fork(void)
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
++  np->system_call_trace = p->system_call_trace;
++
+   pid = np->pid;
+ 
+   release(&np->lock);
+@@ -686,3 +688,15 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++uint64
++count_proc(void)
++{
++  uint64 cnt = 0;
++  for (int i = 0; i < NPROC; ++i) {
++    if (proc[i].state != UNUSED) {
++      cnt++;
++    }
++  }
++  return cnt;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..a83667f 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint64 system_call_trace;
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..3699ab8 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_info(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,8 +128,37 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_sysinfo]   sys_info,
+ };
+ 
++const char *syscall_names[] = {
++[SYS_fork]   "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace",
++[SYS_sysinfo]   "sysinfo",
++};
++
++
+ void
+ syscall(void)
+ {
+@@ -135,10 +166,16 @@ syscall(void)
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
++  //num = * (int *) 0;
+   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+     p->trapframe->a0 = syscalls[num]();
++
++    if ((1 << num) & p->system_call_trace ) {
++      printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], p->trapframe->a0);
++    }
++
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..0dfedc7 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_trace  22
++#define SYS_sysinfo 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..6eb3552 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,6 +5,7 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "sysinfo.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -91,3 +92,27 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_trace(void)
++{
++  int mask;
++  argint(0, &mask);
++  struct proc* p = myproc();
++  p->system_call_trace = mask;
++  return 0;
++}
++
++uint64
++sys_info(void)
++{
++  uint64 addr;
++  argaddr(0, &addr);
++
++  struct sysinfo sinfo;
++  sinfo.freemem = freemem_size();
++  sinfo.nproc = count_proc();
++  if (copyout(myproc()->pagetable, addr, (char *)&sinfo, sizeof(sinfo)))
++    return -1;
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/pingpong.c b/user/pingpong.c
+index a18f738..c15eb3e 100644
+--- a/user/pingpong.c
++++ b/user/pingpong.c
+@@ -1,32 +1,45 @@
+ #include "kernel/types.h"
+-#include "kernel/stat.h"
+ #include "user/user.h"
+ 
+ int
+ main(int argc, char *argv[])
+ {
+-    int p[2];
+-    char buf[10];
+-    pipe(p);
++    int p1[2], p2[2];
++    char buf;
+     int pid;
+-    pid = fork();
+-    if(pid<0){
+-        printf("error\n");
+-        exit(0);
+-    }else if(pid == 0){
+-        read(p[0],buf,sizeof(buf));
+-        printf("%d: received %s\n",getpid(),buf);
+-        write(p[1],"pong",5);
+-        close(p[0]);
+-        close(p[1]);
++
++    pipe(p1);
++    pipe(p2);
++
++
++    if ((pid = fork()) == 0) {
++        close(p1[1]);  
++        close(p2[0]); 
++
++
++        read(p1[0], &buf, 1);
++        printf("%d: received ping\n", getpid());
++
++        write(p2[1], &buf, 1);
++
++        close(p1[0]);
++        close(p2[1]);
+         exit(0);
+-    }else{
+-        write(p[1],"ping",5);
++    } else {
++
++        close(p1[0]);  
++        close(p2[1]);  
++
++        write(p1[1], "a", 1);
++
++        read(p2[0], &buf, 1);
++        printf("%d: received pong\n", getpid());
++
++        close(p1[1]);
++        close(p2[0]);
+         wait(0);
+-        read(p[0],buf,sizeof(buf));
+-        printf("%d: received %s\n",getpid(),buf);
+-        close(p[0]);
+-        close(p[1]);
++        exit(0);
+     }
++
+     exit(0);
+ }
+\ No newline at end of file
+diff --git a/user/primes.c b/user/primes.c
+index a202807..47fa38e 100644
+--- a/user/primes.c
++++ b/user/primes.c
+@@ -10,7 +10,7 @@ main(int argc, char *argv[])
+     pipe(_pipe[0]);
+     int index = 0;
+     int num;
+-    for(int i=min;i<35;++i){
++    for(int i = min;i < 35;++i){
+         write(_pipe[index][1],&i,4);
+     }
+     close(_pipe[0][1]);
+diff --git a/user/sleep.c b/user/sleep.c
+index 9099145..47eb237 100644
+--- a/user/sleep.c
++++ b/user/sleep.c
+@@ -1,16 +1,19 @@
+ #include "kernel/types.h"
+ #include "user/user.h"
+ 
+-int
+-main(int argc, char *argv[])
+-{
++int main(int argc, char *argv[]) {
++    if (argc != 2) {
++        fprintf(2, "Usage: sleep <ticks>\n");
++        exit(1);
++    }
+ 
+-  if (argc != 2) {
+-    fprintf(2, "Usage: sleep ticks...\n");
+-    exit(1);
+-  }
++    int ticks = atoi(argv[1]);
+ 
+-  sleep(atoi(argv[1]) * 10);
++    if (ticks <= 0) {
++        fprintf(2, "Invalid argument: Please provide a positive number of ticks\n");
++        exit(1);
++    }
+ 
+-  exit(0);
++    sleep(ticks);
++    exit(0);
+ }
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..5a60211 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,4 +1,6 @@
+ struct stat;
++struct sysinfo;
++
+ 
+ // system calls
+ int fork(void);
+@@ -22,6 +24,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++int sysinfo(struct sysinfo *);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..bc109fd 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("sysinfo");
